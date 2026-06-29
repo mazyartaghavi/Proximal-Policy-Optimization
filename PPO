@@ -1,0 +1,351 @@
+
+Proximal Policy Optimization for Mobile Robot Navigation.
+
+PPO is an actor-critic policy-gradient algorithm. It improves stability by
+using a clipped surrogate objective:
+
+    L = min(r_t A_t, clip(r_t, 1-epsilon, 1+epsilon) A_t)
+
+where r_t is the probability ratio between the new and old policies.
+
+
+from typing import List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+State = np.ndarray
+Action = np.ndarray
+
+
+class ContinuousMobileRobotEnv:
+    def __init__(
+        self,
+        start: Tuple[float, float] = (0.1, 0.1),
+        goal: Tuple[float, float] = (0.9, 0.9),
+        action_limit: float = 0.05,
+        goal_radius: float = 0.05,
+        max_steps: int = 100,
+    ) -> None:
+        self.start = np.array(start, dtype=np.float32)
+        self.goal = np.array(goal, dtype=np.float32)
+        self.action_limit = action_limit
+        self.goal_radius = goal_radius
+        self.max_steps = max_steps
+        self.state = self.start.copy()
+        self.steps = 0
+
+    def reset(self) -> State:
+        self.state = self.start.copy()
+        self.steps = 0
+        return self.state.copy()
+
+    def step(self, action: Action) -> Tuple[State, float, bool]:
+        self.steps += 1
+
+        action = np.clip(action, -self.action_limit, self.action_limit)
+        next_state = np.clip(self.state + action, 0.0, 1.0)
+
+        distance = np.linalg.norm(next_state - self.goal)
+        reward = -distance
+
+        done = distance <= self.goal_radius or self.steps >= self.max_steps
+
+        if distance <= self.goal_radius:
+            reward += 10.0
+
+        self.state = next_state.astype(np.float32)
+        return self.state.copy(), float(reward), done
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int) -> None:
+        super().__init__()
+
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh(),
+        )
+
+        self.mean_head = nn.Linear(128, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.value_head = nn.Linear(128, 1)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = self.shared(state)
+        mean = self.mean_head(features)
+        std = torch.exp(self.log_std)
+        value = self.value_head(features)
+        return mean, std, value
+
+    def distribution(self, state: torch.Tensor) -> torch.distributions.Normal:
+        mean, std, _ = self.forward(state)
+        return torch.distributions.Normal(mean, std)
+
+
+class PPOAgent:
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        action_limit: float,
+        learning_rate: float = 3e-4,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        clip_ratio: float = 0.2,
+        update_epochs: int = 10,
+        value_loss_weight: float = 0.5,
+        entropy_weight: float = 0.01,
+    ) -> None:
+        self.action_limit = action_limit
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_ratio = clip_ratio
+        self.update_epochs = update_epochs
+        self.value_loss_weight = value_loss_weight
+        self.entropy_weight = entropy_weight
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.network = ActorCritic(state_dim, action_dim).to(self.device)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate)
+
+    def select_action(
+        self,
+        state: State,
+    ) -> Tuple[Action, float, float]:
+        state_tensor = torch.tensor(
+            state,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        distribution = self.network.distribution(state_tensor)
+        raw_action = distribution.sample()
+        log_probability = distribution.log_prob(raw_action).sum(dim=-1)
+
+        _, _, value = self.network(state_tensor)
+
+        action = torch.tanh(raw_action) * self.action_limit
+
+        return (
+            action.cpu().detach().numpy()[0].astype(np.float32),
+            float(log_probability.item()),
+            float(value.item()),
+        )
+
+    def compute_advantages(
+        self,
+        rewards: List[float],
+        values: List[float],
+        dones: List[bool],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        advantages = []
+        gae = 0.0
+        next_value = 0.0
+
+        for step in reversed(range(len(rewards))):
+            mask = 1.0 - float(dones[step])
+            delta = rewards[step] + self.gamma * next_value * mask - values[step]
+            gae = delta + self.gamma * self.gae_lambda * mask * gae
+
+            advantages.insert(0, gae)
+            next_value = values[step]
+
+        advantages_array = np.array(advantages, dtype=np.float32)
+        returns_array = advantages_array + np.array(values, dtype=np.float32)
+
+        advantages_array = (
+            advantages_array - advantages_array.mean()
+        ) / (advantages_array.std() + 1e-8)
+
+        return advantages_array, returns_array
+
+    def update(
+        self,
+        states: List[State],
+        actions: List[Action],
+        old_log_probs: List[float],
+        advantages: np.ndarray,
+        returns: np.ndarray,
+    ) -> None:
+        states_tensor = torch.tensor(
+            np.array(states),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        actions_tensor = torch.tensor(
+            np.array(actions),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        old_log_probs_tensor = torch.tensor(
+            old_log_probs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        advantages_tensor = torch.tensor(
+            advantages,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        returns_tensor = torch.tensor(
+            returns,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        for _ in range(self.update_epochs):
+            distribution = self.network.distribution(states_tensor)
+
+            new_log_probs = distribution.log_prob(actions_tensor).sum(dim=-1)
+
+            _, _, values = self.network(states_tensor)
+            values = values.squeeze(-1)
+
+            probability_ratio = torch.exp(new_log_probs - old_log_probs_tensor)
+
+            unclipped_objective = probability_ratio * advantages_tensor
+            clipped_objective = torch.clamp(
+                probability_ratio,
+                1.0 - self.clip_ratio,
+                1.0 + self.clip_ratio,
+            ) * advantages_tensor
+
+            actor_loss = -torch.min(
+                unclipped_objective,
+                clipped_objective,
+            ).mean()
+
+            critic_loss = nn.MSELoss()(values, returns_tensor)
+            entropy_loss = -distribution.entropy().sum(dim=-1).mean()
+
+            total_loss = (
+                actor_loss
+                + self.value_loss_weight * critic_loss
+                + self.entropy_weight * entropy_loss
+            )
+
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            self.optimizer.step()
+
+
+def train_ppo(
+    episodes: int = 1000,
+) -> Tuple[ContinuousMobileRobotEnv, PPOAgent, List[float]]:
+    env = ContinuousMobileRobotEnv()
+
+    agent = PPOAgent(
+        state_dim=2,
+        action_dim=2,
+        action_limit=env.action_limit,
+    )
+
+    episode_rewards: List[float] = []
+
+    for episode in range(episodes):
+        state = env.reset()
+
+        states: List[State] = []
+        actions: List[Action] = []
+        rewards: List[float] = []
+        dones: List[bool] = []
+        old_log_probs: List[float] = []
+        values: List[float] = []
+
+        done = False
+        total_reward = 0.0
+
+        while not done:
+            action, log_prob, value = agent.select_action(state)
+            next_state, reward, done = env.step(action)
+
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            dones.append(done)
+            old_log_probs.append(log_prob)
+            values.append(value)
+
+            state = next_state
+            total_reward += reward
+
+        advantages, returns = agent.compute_advantages(
+            rewards=rewards,
+            values=values,
+            dones=dones,
+        )
+
+        agent.update(
+            states=states,
+            actions=actions,
+            old_log_probs=old_log_probs,
+            advantages=advantages,
+            returns=returns,
+        )
+
+        episode_rewards.append(total_reward)
+
+        if (episode + 1) % 100 == 0:
+            print(
+                f"Episode {episode + 1:4d} | "
+                f"Reward: {total_reward:8.3f}"
+            )
+
+    return env, agent, episode_rewards
+
+
+def simulate_policy(
+    env: ContinuousMobileRobotEnv,
+    agent: PPOAgent,
+    max_steps: int = 100,
+) -> List[Tuple[float, float]]:
+    state = env.reset()
+    path = [tuple(state)]
+
+    for _ in range(max_steps):
+        state_tensor = torch.tensor(
+            state,
+            dtype=torch.float32,
+            device=agent.device,
+        ).unsqueeze(0)
+
+        with torch.no_grad():
+            mean, _, _ = agent.network(state_tensor)
+            action = torch.tanh(mean) * agent.action_limit
+
+        action_array = action.cpu().numpy()[0].astype(np.float32)
+        state, _, done = env.step(action_array)
+        path.append(tuple(state))
+
+        if done:
+            break
+
+    return path
+
+
+def main() -> None:
+    env, agent, _ = train_ppo(episodes=1000)
+
+    path = simulate_policy(env, agent)
+
+    print("\nSimulated Robot Path:")
+    for point in path:
+        print(f"({point[0]:.3f}, {point[1]:.3f})")
+
+
+if __name__ == "__main__":
+    main()
