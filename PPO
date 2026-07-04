@@ -9,8 +9,6 @@ using a clipped surrogate objective:
 where r_t is the probability ratio between the new and old policies.
 
 
-from typing import List, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
